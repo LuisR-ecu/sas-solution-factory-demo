@@ -1,0 +1,18 @@
+# Node
+node_modules
+dist
+.vite
+
+# Python
+__pycache__
+.venv
+*.pyc
+
+# Env
+.env
+
+# OS
+.DS_Store
+
+# IDE
+.vscode
