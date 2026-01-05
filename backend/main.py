@@ -124,3 +124,20 @@ def churn_by_contract() -> List[Dict[str, Any]]:
 def churn_by_internet() -> List[Dict[str, Any]]:
     g = df.groupby("internet")["churn"].mean().reset_index()
     return [{"internet": row["internet"], "churn_rate": float(row["churn"])} for _, row in g.iterrows()]
+
+@app.get("/predict/{customer_id}")
+async def predict_churn(customer_id: str):
+    #simulate prediction logic
+    probability = model.predict_proba(customer_data)[0][1]
+    
+    #get feauture importance (coefficients for Logistic Regression)
+    # This provides the "why" behind the answer [cite: 64]
+    feature_importance = dict(zip(X.columns, model.coef_[0]))
+    top_drivers = sorted(feature_importance.items(), key = lambda x: abs(x[1]), reverse = True)[:3]
+    
+    return {
+        "customer_id": customer_id,
+        "churn_probability": round(probability, 2),
+        "risk_factors": [{"feature": f, "impact": round(i, 2)} for f, i in top_drivers]
+    }
+    
