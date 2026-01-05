@@ -64,14 +64,14 @@ to deliver actionable insights in a clean, interactive interface.
 cd backend
 source .venv/bin/activate
 uvicorn main:app --reload --port 8000
-'''
+```
 
 ### Frontend
 ```bash
 cd frontend
 npm install
 npm run dev
-'''
+```
 
 ## 🎯 Why This Project
 
