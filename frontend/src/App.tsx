@@ -1,118 +1,356 @@
-import React, { useState } from 'react';
-import { Users, AlertTriangle, TrendingDown, BarChart3 } from 'lucide-react'; // Install lucide-react for icons
-import { ChurnSimulator } from './components/ChurnSimulator';
-import { 
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell 
+import React, { useEffect, useMemo, useState } from 'react';
+import './App.css';
+import { Users, AlertTriangle, BarChart3, Download, Info } from 'lucide-react';
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
 } from 'recharts';
+import { ChurnSimulator } from './components/ChurnSimulator';
 
-// Mock data for the visualization
-const chartData = [
-  { name: 'Month-to-Month', rate: 42, color: '#ef4444' },
-  { name: 'One Year', rate: 11, color: '#f59e0b' },
-  { name: 'Two Year', rate: 3, color: '#10b981' },
-];
+type Summary = {
+  total_customers: number;
+  churn_rate: number;
+  avg_churn_probability: number;
+  high_risk_alerts: number;
+  moderate_risk_alerts: number;
+  threshold_high: number;
+  threshold_moderate: number;
+};
 
-const App = () => {
-  const [selectedCustomer] = useState({
-    id: "7010-BRMAI",
-    probability: 0.72,
-    contract: "Month-to-month"
+type ChurnSegment = {
+  segment: string;
+  churn_rate: number;
+  customers: number;
+};
+
+type Customer = {
+  customer_id: string;
+  tenure_months: number;
+  monthly_charges: number;
+  contract: string;
+  internet: string;
+  support_tickets: number;
+  churn: number;
+  churn_probability: number;
+  risk_label: string;
+};
+
+type Prediction = {
+  churn_probability: number;
+  risk_label: string;
+  risk_factors: { feature: string; impact: number }[];
+};
+
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+
+const percent = (val: number | undefined, digits = 1) =>
+  val === undefined ? '—' : `${(val * 100).toFixed(digits)}%`;
+
+const formatCurrency = (val: number) => `$${val.toFixed(2)}`;
+
+const fetchJson = async <T,>(path: string, options?: RequestInit): Promise<T> => {
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { 'Content-Type': 'application/json' },
+    ...options,
   });
+  if (!res.ok) throw new Error(`Request failed: ${res.status}`);
+  return res.json();
+};
+
+const App: React.FC = () => {
+  const [summary, setSummary] = useState<Summary | null>(null);
+  const [contractData, setContractData] = useState<ChurnSegment[]>([]);
+  const [internetData, setInternetData] = useState<ChurnSegment[]>([]);
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [search, setSearch] = useState('');
+  const [sortKey, setSortKey] = useState<'tenure_months' | 'monthly_charges' | 'support_tickets'>(
+    'tenure_months',
+  );
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [selected, setSelected] = useState<Customer | null>(null);
+  const [prediction, setPrediction] = useState<Prediction | null>(null);
+  const [predictLoading, setPredictLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Initial data load
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const [summaryResp, contractResp, internetResp, customersResp] = await Promise.all([
+          fetchJson<Summary>('/data/summary'),
+          fetchJson<ChurnSegment[]>('/data/churn_by_contract'),
+          fetchJson<ChurnSegment[]>('/data/churn_by_internet'),
+          fetchJson<Customer[]>('/data/customers'),
+        ]);
+        setSummary(summaryResp);
+        setContractData(contractResp);
+        setInternetData(internetResp);
+        setCustomers(customersResp);
+      } catch (err) {
+        console.error(err);
+        setError('Unable to load data from API.');
+      }
+    };
+    load();
+  }, []);
+
+  // Predict when selection changes
+  useEffect(() => {
+    const runPrediction = async () => {
+      if (!selected) return;
+      setPredictLoading(true);
+      try {
+        const payload = {
+          tenure_months: selected.tenure_months,
+          monthly_charges: selected.monthly_charges,
+          contract: selected.contract,
+          internet: selected.internet,
+          support_tickets: selected.support_tickets,
+        };
+        const resp = await fetchJson<Prediction>('/predict', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        setPrediction(resp);
+      } catch (err) {
+        console.error(err);
+        setPrediction(null);
+      } finally {
+        setPredictLoading(false);
+      }
+    };
+    runPrediction();
+  }, [selected]);
+
+  const filtered = useMemo(() => {
+    const term = search.trim().toLowerCase();
+    const subset = term
+      ? customers.filter((c) => c.customer_id.toLowerCase().includes(term))
+      : [...customers];
+    return subset.sort((a, b) => {
+      const factor = sortDir === 'asc' ? 1 : -1;
+      if (a[sortKey] < b[sortKey]) return -1 * factor;
+      if (a[sortKey] > b[sortKey]) return 1 * factor;
+      return 0;
+    });
+  }, [customers, search, sortKey, sortDir]);
+
+  const exportCsv = async () => {
+    try {
+      const threshold = summary?.threshold_high ?? 0.7;
+      const res = await fetch(`${API_BASE}/export/high_risk.csv?threshold=${threshold}`);
+      if (!res.ok) throw new Error('Export failed');
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'outreach-high-risk.csv';
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error(err);
+      setError('CSV export failed.');
+    }
+  };
+
+  const toggleSort = (key: typeof sortKey) => {
+    if (key === sortKey) {
+      setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortKey(key);
+      setSortDir('desc');
+    }
+  };
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 font-sans">
-      {/* Navigation Header */}
-      <nav className="bg-white border-b border-slate-200 px-8 py-4 flex justify-between items-center sticky top-0 z-10">
-        <div className="flex items-center gap-2">
-          <div className="bg-blue-600 p-2 rounded-lg">
-            <BarChart3 className="text-white" size={20} />
+    <div className="app-shell">
+      <nav className="nav">
+        <div className="brand">
+          <div className="brand-mark">
+            <BarChart3 size={18} />
           </div>
-          <span className="font-bold text-xl tracking-tight text-slate-800">
-            Solutions<span className="text-blue-600">Factory</span>
-          </span>
+          Customer Retention Intelligence Dashboard
         </div>
-        <div className="text-sm font-medium text-slate-500">Churn Analytics Demo v2.0</div>
       </nav>
 
-      <main className="max-w-7xl mx-auto p-8">
-        {/* Header Section */}
-        <header className="mb-8">
-          <h1 className="text-3xl font-extrabold text-slate-900">Executive Dashboard</h1>
-          <p className="text-slate-500 mt-1">Transforming customer data into retention intelligence.</p>
-        </header>
+      <header>
+        <h1 className="page-title">Churn Risk Intelligence</h1>
+        <p className="muted">Predictive churn risk monitoring and retention strategy simulation.</p>
+      </header>
 
-        {/* KPI Scorecards */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-          <StatCard title="Total Customers" value="7,043" icon={<Users className="text-blue-600" />} trend="+2.5%" />
-          <StatCard title="Avg. Churn Risk" value="26.5%" icon={<TrendingDown className="text-amber-500" />} trend="-1.2%" />
-          <StatCard title="High Risk Alerts" value="1,869" icon={<AlertTriangle className="text-red-500" />} trend="+4.0%" />
+      {error && <div className="card" style={{ color: '#b91c1c' }}>{error}</div>}
+
+      <div className="grid kpi-grid">
+        <KpiCard
+          title="Total Customers"
+          value={summary ? summary.total_customers.toLocaleString() : '—'}
+          icon={<Users size={18} />}
+          helper="Rows in data feed"
+        />
+        <KpiCard
+          title="Avg. Churn Risk"
+          value={summary ? percent(summary.avg_churn_probability, 1) : '—'}
+          icon={<BarChart3 size={18} />}
+          helper="Mean predicted probability"
+        />
+        <KpiCard
+          title="High Risk Alerts"
+          value={summary ? summary.high_risk_alerts.toLocaleString() : '—'}
+          icon={<AlertTriangle size={18} />}
+          helper={`Prob ≥ ${(summary?.threshold_high ?? 0.7) * 100}%`}
+        />
+      </div>
+
+      <div className="grid charts" style={{ marginTop: 18 }}>
+        <div className="card">
+          <div className="section-title">Churn Rate by Contract Type</div>
+          <Chart data={contractData} />
         </div>
+        <div className="card">
+          <div className="section-title">Churn Rate by Internet Service</div>
+          <Chart data={internetData} />
+        </div>
+      </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          {/* Main Visualizations */}
-          <div className="lg:col-span-2 space-y-8">
-            <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
-              <h3 className="text-lg font-bold mb-6 flex items-center gap-2">
-                Churn Rate by Contract Type
-              </h3>
-              <div className="h-64 w-full">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={chartData}>
-                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                    <XAxis dataKey="name" axisLine={false} tickLine={false} />
-                    <YAxis axisLine={false} tickLine={false} unit="%" />
-                    <Tooltip 
-                      cursor={{fill: '#f8fafc'}}
-                      contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)'}} 
-                    />
-                    <Bar dataKey="rate" radius={[4, 4, 0, 0]}>
-                      {chartData.map((entry, index) => (
-                        <Cell key={`cell-${index}`} fill={entry.color} />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
+      <div className="card table-wrap" style={{ marginTop: 18 }}>
+        <div className="section-title">Customer Risk Registry</div>
+        <div className="table-actions">
+          <input
+            className="search"
+            placeholder="Search by customer_id"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          <button className="button" onClick={exportCsv}>
+            <Download size={14} style={{ marginRight: 6, verticalAlign: 'text-bottom' }} />
+            Generate outreach list
+          </button>
+        </div>
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Customer</th>
+              <th onClick={() => toggleSort('tenure_months')}>Tenure</th>
+              <th onClick={() => toggleSort('monthly_charges')}>Monthly Charges</th>
+              <th>Contract</th>
+              <th>Internet</th>
+              <th onClick={() => toggleSort('support_tickets')}>Tickets</th>
+              <th>Risk</th>
+              <th>Churn Prob</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((c) => (
+              <tr key={c.customer_id} onClick={() => setSelected(c)} style={{ cursor: 'pointer' }}>
+                <td>{c.customer_id}</td>
+                <td>{c.tenure_months} mo</td>
+                <td>{formatCurrency(c.monthly_charges)}</td>
+                <td>{c.contract}</td>
+                <td>{c.internet}</td>
+                <td>{c.support_tickets}</td>
+                <td>
+                  <span className={`pill ${c.risk_label.toLowerCase()}`}>{c.risk_label}</span>
+                </td>
+                <td>{percent(c.churn_probability, 1)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="card" style={{ marginTop: 16 }}>
+        <div className="section-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Info size={14} /> Definitions
+        </div>
+        <p className="muted">
+          Churn risk = predicted probability from logistic regression. High risk threshold ={' '}
+          {(summary?.threshold_high ?? 0.7) * 100}% · Moderate = {(summary?.threshold_moderate ?? 0.5) * 100}%.
+        </p>
+      </div>
+
+      {selected && (
+        <>
+          <div className="backdrop" onClick={() => setSelected(null)} />
+          <aside className="drawer">
+            <h3 style={{ marginTop: 0 }}>{selected.customer_id}</h3>
+            <p className="muted">
+              {selected.contract} · {selected.internet} · {selected.tenure_months} months
+            </p>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
+              <span className={`pill ${selected.risk_label.toLowerCase()}`}>{selected.risk_label}</span>
+              <span style={{ fontWeight: 700 }}>{percent(prediction?.churn_probability ?? selected.churn_probability, 1)}</span>
             </div>
 
-            {/* Placeholder for Customer Table */}
-            <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 h-64 flex items-center justify-center text-slate-400 italic">
-              Interactive Customer Table (Filterable by Risk Segment)
-            </div>
-          </div>
+            <hr className="divider" />
 
-          {/* Side Panel: Intelligence Tools */}
-          <div className="space-y-6">
-             <ChurnSimulator initialData={selectedCustomer} />
-             
-             <div className="bg-blue-600 p-6 rounded-2xl text-white shadow-lg shadow-blue-200">
-                <h4 className="font-bold text-lg mb-2">Proactive Retention</h4>
-                <p className="text-blue-100 text-sm leading-relaxed">
-                  Moving Month-to-Month customers to One-Year contracts reduces churn probability by an average of 31%.
-                </p>
-                <button className="mt-4 w-full bg-white text-blue-600 font-bold py-2 rounded-xl hover:bg-blue-50 transition-colors">
-                  View Strategy Guide
-                </button>
-             </div>
-          </div>
-        </div>
-      </main>
+            <div className="section-title">Top Drivers</div>
+            {predictLoading && <p className="muted">Loading explainability…</p>}
+            {!predictLoading && prediction && prediction.risk_factors && (
+              <ul style={{ paddingLeft: 16, margin: 0 }}>
+                {prediction.risk_factors.map((f) => (
+                  <li key={f.feature} style={{ marginBottom: 6 }}>
+                    {f.feature} <span className="muted">({f.impact >= 0 ? '+' : ''}{f.impact.toFixed(3)})</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            <hr className="divider" />
+
+            <ChurnSimulator
+              apiBase={API_BASE}
+              customer={selected}
+              baselineProb={prediction?.churn_probability ?? selected.churn_probability ?? 0}
+            />
+          </aside>
+        </>
+      )}
+
     </div>
   );
 };
 
-// Helper Component for Stats
-const StatCard = ({ title, value, icon, trend }) => (
-  <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 hover:border-blue-300 transition-colors cursor-default">
-    <div className="flex justify-between items-start mb-4">
-      <div className="p-2 bg-slate-50 rounded-lg">{icon}</div>
-      <span className={`text-xs font-bold px-2 py-1 rounded-md ${trend.startsWith('+') ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-600'}`}>
-        {trend}
-      </span>
+export default App;
+
+const KpiCard = ({
+  title,
+  value,
+  icon,
+  helper,
+}: {
+  title: string;
+  value: string;
+  icon: React.ReactNode;
+  helper: string;
+}) => (
+  <div className="card">
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div style={{ width: 36, height: 36, background: '#e8f3ff', borderRadius: 10, display: 'grid', placeItems: 'center', color: '#0f7ef1' }}>
+        {icon}
+      </div>
+      <span className="kpi-trend">Live</span>
     </div>
-    <p className="text-sm font-medium text-slate-500">{title}</p>
-    <p className="text-2xl font-black text-slate-900 mt-1">{value}</p>
+    <div className="muted" style={{ marginTop: 6 }}>{title}</div>
+    <div className="kpi-value">{value}</div>
+    <div className="muted" style={{ fontSize: 12 }}>{helper}</div>
   </div>
 );
 
-export default App;
+const Chart = ({ data }: { data: ChurnSegment[] }) => (
+  <div style={{ height: 260 }}>
+    <ResponsiveContainer width="100%" height="100%">
+      <BarChart data={data} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+        <XAxis dataKey="segment" tick={{ fontSize: 12 }} />
+        <YAxis tickFormatter={(v) => `${(v * 100).toFixed(0)}%`} width={52} />
+        <Tooltip formatter={(v: number) => `${(v * 100).toFixed(1)}%`} />
+        <Bar dataKey="churn_rate" radius={[6, 6, 0, 0]} fill="#0f7ef1" />
+      </BarChart>
+    </ResponsiveContainer>
+  </div>
+);
