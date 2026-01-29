@@ -1,136 +1,356 @@
-import { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import './App.css';
-import { Users, AlertTriangle, TrendingDown, BarChart3, RefreshCw, ChevronRight, LayoutDashboard, Database } from 'lucide-react';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
+import { Users, AlertTriangle, BarChart3, Download, Info } from 'lucide-react';
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+} from 'recharts';
+import { ChurnSimulator } from './components/ChurnSimulator';
 
-// TARGET: Your Proxmox VM Tailscale IP
+type Summary = {
+  total_customers: number;
+  churn_rate: number;
+  avg_churn_probability: number;
+  high_risk_alerts: number;
+  moderate_risk_alerts: number;
+  threshold_high: number;
+  threshold_moderate: number;
+};
+
+type ChurnSegment = {
+  segment: string;
+  churn_rate: number;
+  customers: number;
+};
+
+type Customer = {
+  customer_id: string;
+  tenure_months: number;
+  monthly_charges: number;
+  contract: string;
+  internet: string;
+  support_tickets: number;
+  churn: number;
+  churn_probability: number;
+  risk_label: string;
+};
+
+type Prediction = {
+  churn_probability: number;
+  risk_label: string;
+  risk_factors: { feature: string; impact: number }[];
+};
+
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
-const App = () => {
-  const [customers, setCustomers] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(false);
+const percent = (val: number | undefined, digits = 1) =>
+  val === undefined ? '—' : `${(val * 100).toFixed(digits)}%`;
 
+const formatCurrency = (val: number) => `$${val.toFixed(2)}`;
+
+const fetchJson = async <T,>(path: string, options?: RequestInit): Promise<T> => {
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { 'Content-Type': 'application/json' },
+    ...options,
+  });
+  if (!res.ok) throw new Error(`Request failed: ${res.status}`);
+  return res.json();
+};
+
+const App: React.FC = () => {
+  const [summary, setSummary] = useState<Summary | null>(null);
+  const [contractData, setContractData] = useState<ChurnSegment[]>([]);
+  const [internetData, setInternetData] = useState<ChurnSegment[]>([]);
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [search, setSearch] = useState('');
+  const [sortKey, setSortKey] = useState<'tenure_months' | 'monthly_charges' | 'support_tickets'>(
+    'tenure_months',
+  );
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [selected, setSelected] = useState<Customer | null>(null);
+  const [prediction, setPrediction] = useState<Prediction | null>(null);
+  const [predictLoading, setPredictLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Initial data load
   useEffect(() => {
-    const fetchData = async () => {
+    const load = async () => {
       try {
-        const res = await fetch(`${API_BASE}/data/customers`);
-        if (!res.ok) throw new Error('Backend Offline');
-        const data = await res.json();
-        setCustomers(data);
-        setLoading(false);
+        const [summaryResp, contractResp, internetResp, customersResp] = await Promise.all([
+          fetchJson<Summary>('/data/summary'),
+          fetchJson<ChurnSegment[]>('/data/churn_by_contract'),
+          fetchJson<ChurnSegment[]>('/data/churn_by_internet'),
+          fetchJson<Customer[]>('/data/customers'),
+        ]);
+        setSummary(summaryResp);
+        setContractData(contractResp);
+        setInternetData(internetResp);
+        setCustomers(customersResp);
       } catch (err) {
-        console.error("Connection Error:", err);
-        setError(true);
-        setLoading(false);
+        console.error(err);
+        setError('Unable to load data from API.');
       }
     };
-    fetchData();
+    load();
   }, []);
 
-  if (loading) return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-slate-950 text-blue-500">
-      <RefreshCw className="animate-spin mb-4" size={48} />
-      <p className="font-mono text-sm tracking-widest uppercase text-slate-500">Initializing Factory Node: pve-01</p>
-    </div>
-  );
+  // Predict when selection changes
+  useEffect(() => {
+    const runPrediction = async () => {
+      if (!selected) return;
+      setPredictLoading(true);
+      try {
+        const payload = {
+          tenure_months: selected.tenure_months,
+          monthly_charges: selected.monthly_charges,
+          contract: selected.contract,
+          internet: selected.internet,
+          support_tickets: selected.support_tickets,
+        };
+        const resp = await fetchJson<Prediction>('/predict', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        setPrediction(resp);
+      } catch (err) {
+        console.error(err);
+        setPrediction(null);
+      } finally {
+        setPredictLoading(false);
+      }
+    };
+    runPrediction();
+  }, [selected]);
+
+  const filtered = useMemo(() => {
+    const term = search.trim().toLowerCase();
+    const subset = term
+      ? customers.filter((c) => c.customer_id.toLowerCase().includes(term))
+      : [...customers];
+    return subset.sort((a, b) => {
+      const factor = sortDir === 'asc' ? 1 : -1;
+      if (a[sortKey] < b[sortKey]) return -1 * factor;
+      if (a[sortKey] > b[sortKey]) return 1 * factor;
+      return 0;
+    });
+  }, [customers, search, sortKey, sortDir]);
+
+  const exportCsv = async () => {
+    try {
+      const threshold = summary?.threshold_high ?? 0.7;
+      const res = await fetch(`${API_BASE}/export/high_risk.csv?threshold=${threshold}`);
+      if (!res.ok) throw new Error('Export failed');
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'outreach-high-risk.csv';
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error(err);
+      setError('CSV export failed.');
+    }
+  };
+
+  const toggleSort = (key: typeof sortKey) => {
+    if (key === sortKey) {
+      setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortKey(key);
+      setSortDir('desc');
+    }
+  };
 
   return (
-    <div className="min-h-screen bg-[#020617] text-slate-300 selection:bg-blue-500/30 font-sans">
-      {/* Top Header */}
-      <nav className="border-b border-slate-800/60 bg-slate-900/40 backdrop-blur-md sticky top-0 z-50 px-8 py-4 flex justify-between items-center">
-        <div className="flex items-center gap-3">
-          <div className="bg-blue-600 p-1.5 rounded-lg shadow-lg shadow-blue-900/40">
-            <LayoutDashboard size={20} className="text-white" />
+    <div className="app-shell">
+      <nav className="nav">
+        <div className="brand">
+          <div className="brand-mark">
+            <BarChart3 size={18} />
           </div>
-          <span className="font-bold text-xl tracking-tight text-white">Solutions<span className="text-blue-500">Factory</span></span>
-        </div>
-        <div className="flex gap-4 items-center">
-           <span className="flex items-center gap-2 text-[10px] font-black uppercase tracking-[0.2em] text-slate-500 border border-slate-800 px-3 py-1 rounded-full">
-             <Database size={12} className="text-blue-500" />
-             Tailscale Active: {API_BASE.includes('100.') ? 'Remote' : 'Local'}
-           </span>
+          Customer Retention Intelligence Dashboard
         </div>
       </nav>
 
-      <main className="max-w-7xl mx-auto p-8">
-        <div className="mb-10">
-          <h1 className="text-4xl font-black text-white tracking-tighter">Executive Dashboard</h1>
-          <p className="text-slate-500 font-medium mt-1">Churn Intelligence & Predictive Risk Modeling</p>
+      <header>
+        <h1 className="page-title">Churn Risk Intelligence</h1>
+        <p className="muted">Predictive churn risk monitoring and retention strategy simulation.</p>
+      </header>
+
+      {error && <div className="card" style={{ color: '#b91c1c' }}>{error}</div>}
+
+      <div className="grid kpi-grid">
+        <KpiCard
+          title="Total Customers"
+          value={summary ? summary.total_customers.toLocaleString() : '—'}
+          icon={<Users size={18} />}
+          helper="Rows in data feed"
+        />
+        <KpiCard
+          title="Avg. Churn Risk"
+          value={summary ? percent(summary.avg_churn_probability, 1) : '—'}
+          icon={<BarChart3 size={18} />}
+          helper="Mean predicted probability"
+        />
+        <KpiCard
+          title="High Risk Alerts"
+          value={summary ? summary.high_risk_alerts.toLocaleString() : '—'}
+          icon={<AlertTriangle size={18} />}
+          helper={`Prob ≥ ${(summary?.threshold_high ?? 0.7) * 100}%`}
+        />
+      </div>
+
+      <div className="grid charts" style={{ marginTop: 18 }}>
+        <div className="card">
+          <div className="section-title">Churn Rate by Contract Type</div>
+          <Chart data={contractData} />
         </div>
-
-        {/* KPI Grid */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
-          <StatCard title="Total Customers" value={customers.length || "7,043"} icon={<Users className="text-blue-400"/>} trend="+2.5%" />
-          <StatCard title="Avg. Churn Risk" value="26.5%" icon={<TrendingDown className="text-emerald-400"/>} trend="-1.2%" />
-          <StatCard title="High Risk Alerts" value="1,869" icon={<AlertTriangle className="text-red-400"/>} trend="+4.0%" />
+        <div className="card">
+          <div className="section-title">Churn Rate by Internet Service</div>
+          <Chart data={internetData} />
         </div>
+      </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          <div className="lg:col-span-2 space-y-8">
-            <div className="bg-slate-900/50 border border-slate-800 p-8 rounded-[2rem] shadow-2xl">
-               <h3 className="text-white font-bold mb-8 flex items-center gap-2">
-                 <BarChart3 size={18} className="text-blue-500" /> Churn by Contract Type
-               </h3>
-               <div className="h-64">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={[{name: 'Monthly', val: 42}, {name: '1-Year', val: 11}, {name: '2-Year', val: 3}]}>
-                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#1e293b" />
-                    <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{fill: '#475569', fontSize: 12}} />
-                    <YAxis axisLine={false} tickLine={false} tick={{fill: '#475569', fontSize: 12}} unit="%" />
-                    <Tooltip cursor={{fill: 'rgba(255,255,255,0.05)'}} contentStyle={{backgroundColor: '#0f172a', border: '1px solid #1e293b', borderRadius: '12px'}} />
-                    <Bar dataKey="val" radius={[6, 6, 0, 0]} barSize={45}>
-                      <Cell fill="#ef4444" /><Cell fill="#f59e0b" /><Cell fill="#10b981" />
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-               </div>
+      <div className="card table-wrap" style={{ marginTop: 18 }}>
+        <div className="section-title">Customer Risk Registry</div>
+        <div className="table-actions">
+          <input
+            className="search"
+            placeholder="Search by customer_id"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          <button className="button" onClick={exportCsv}>
+            <Download size={14} style={{ marginRight: 6, verticalAlign: 'text-bottom' }} />
+            Generate outreach list
+          </button>
+        </div>
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Customer</th>
+              <th onClick={() => toggleSort('tenure_months')}>Tenure</th>
+              <th onClick={() => toggleSort('monthly_charges')}>Monthly Charges</th>
+              <th>Contract</th>
+              <th>Internet</th>
+              <th onClick={() => toggleSort('support_tickets')}>Tickets</th>
+              <th>Risk</th>
+              <th>Churn Prob</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((c) => (
+              <tr key={c.customer_id} onClick={() => setSelected(c)} style={{ cursor: 'pointer' }}>
+                <td>{c.customer_id}</td>
+                <td>{c.tenure_months} mo</td>
+                <td>{formatCurrency(c.monthly_charges)}</td>
+                <td>{c.contract}</td>
+                <td>{c.internet}</td>
+                <td>{c.support_tickets}</td>
+                <td>
+                  <span className={`pill ${c.risk_label.toLowerCase()}`}>{c.risk_label}</span>
+                </td>
+                <td>{percent(c.churn_probability, 1)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="card" style={{ marginTop: 16 }}>
+        <div className="section-title" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Info size={14} /> Definitions
+        </div>
+        <p className="muted">
+          Churn risk = predicted probability from logistic regression. High risk threshold ={' '}
+          {(summary?.threshold_high ?? 0.7) * 100}% · Moderate = {(summary?.threshold_moderate ?? 0.5) * 100}%.
+        </p>
+      </div>
+
+      {selected && (
+        <>
+          <div className="backdrop" onClick={() => setSelected(null)} />
+          <aside className="drawer">
+            <h3 style={{ marginTop: 0 }}>{selected.customer_id}</h3>
+            <p className="muted">
+              {selected.contract} · {selected.internet} · {selected.tenure_months} months
+            </p>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
+              <span className={`pill ${selected.risk_label.toLowerCase()}`}>{selected.risk_label}</span>
+              <span style={{ fontWeight: 700 }}>{percent(prediction?.churn_probability ?? selected.churn_probability, 1)}</span>
             </div>
 
-            <div className="bg-slate-900/50 border border-slate-800 rounded-[2rem] overflow-hidden shadow-2xl">
-              <div className="p-6 border-b border-slate-800 bg-slate-900/80 flex justify-between items-center">
-                <h3 className="text-white font-bold">Customer Risk Registry</h3>
-                {error && <span className="text-[10px] bg-red-500/20 text-red-400 px-2 py-1 rounded">API Offline</span>}
-              </div>
-              <div className="p-8 text-center text-slate-500 italic text-sm">
-                Interactive customer data streaming from pve-01 node...
-              </div>
-            </div>
-          </div>
+            <hr className="divider" />
 
-          <aside className="space-y-6">
-            <div className="bg-gradient-to-br from-blue-600 to-indigo-900 p-8 rounded-[2.5rem] text-white shadow-xl shadow-blue-900/20">
-              <h4 className="font-black text-xl mb-3 tracking-tight">System Status</h4>
-              <p className="text-blue-100 text-sm leading-relaxed mb-6">
-                Node <strong>pve-01</strong> is currently processing telemetry data. Predictive models are synced via <strong>Tailscale</strong>.
-              </p>
-              <div className="space-y-3">
-                <div className="flex justify-between text-xs font-bold border-b border-white/10 pb-2">
-                  <span className="text-blue-200">Uptime</span>
-                  <span>99.9%</span>
-                </div>
-                <div className="flex justify-between text-xs font-bold border-b border-white/10 pb-2">
-                  <span className="text-blue-200">Latency</span>
-                  <span>42ms</span>
-                </div>
-              </div>
-            </div>
+            <div className="section-title">Top Drivers</div>
+            {predictLoading && <p className="muted">Loading explainability…</p>}
+            {!predictLoading && prediction && prediction.risk_factors && (
+              <ul style={{ paddingLeft: 16, margin: 0 }}>
+                {prediction.risk_factors.map((f) => (
+                  <li key={f.feature} style={{ marginBottom: 6 }}>
+                    {f.feature} <span className="muted">({f.impact >= 0 ? '+' : ''}{f.impact.toFixed(3)})</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            <hr className="divider" />
+
+            <ChurnSimulator
+              apiBase={API_BASE}
+              customer={selected}
+              baselineProb={prediction?.churn_probability ?? selected.churn_probability ?? 0}
+            />
           </aside>
-        </div>
-      </main>
+        </>
+      )}
+
     </div>
   );
 };
 
-const StatCard = ({ title, value, icon, trend }: any) => (
-  <div className="bg-slate-900/40 border border-slate-800/60 p-7 rounded-[2rem] hover:border-blue-500/40 transition-all group">
-    <div className="flex justify-between mb-6">
-      <div className="p-3 bg-slate-950 rounded-2xl border border-slate-800 group-hover:scale-110 transition-transform">{icon}</div>
-      <span className={`text-[10px] font-black px-2.5 py-1 rounded-lg ${trend.includes('+') ? 'bg-red-500/10 text-red-400' : 'bg-emerald-500/10 text-emerald-400'}`}>{trend}</span>
+export default App;
+
+const KpiCard = ({
+  title,
+  value,
+  icon,
+  helper,
+}: {
+  title: string;
+  value: string;
+  icon: React.ReactNode;
+  helper: string;
+}) => (
+  <div className="card">
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div style={{ width: 36, height: 36, background: '#e8f3ff', borderRadius: 10, display: 'grid', placeItems: 'center', color: '#0f7ef1' }}>
+        {icon}
+      </div>
+      <span className="kpi-trend">Live</span>
     </div>
-    <h3 className="text-slate-500 text-xs font-bold uppercase tracking-widest">{title}</h3>
-    <p className="text-3xl font-black text-white mt-1 tracking-tighter">{value}</p>
+    <div className="muted" style={{ marginTop: 6 }}>{title}</div>
+    <div className="kpi-value">{value}</div>
+    <div className="muted" style={{ fontSize: 12 }}>{helper}</div>
   </div>
 );
 
-export default App;
+const Chart = ({ data }: { data: ChurnSegment[] }) => (
+  <div style={{ height: 260 }}>
+    <ResponsiveContainer width="100%" height="100%">
+      <BarChart data={data} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+        <XAxis dataKey="segment" tick={{ fontSize: 12 }} />
+        <YAxis tickFormatter={(v) => `${(v * 100).toFixed(0)}%`} width={52} />
+        <Tooltip formatter={(v: number) => `${(v * 100).toFixed(1)}%`} />
+        <Bar dataKey="churn_rate" radius={[6, 6, 0, 0]} fill="#0f7ef1" />
+      </BarChart>
+    </ResponsiveContainer>
+  </div>
+);
